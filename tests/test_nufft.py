@@ -176,3 +176,46 @@ def test_nufft_dtype_transfer(shape, kdata_shape, is_complex, dtype):
 
     _ = forw_ob(image, ktraj)
     _ = adj_ob(kdata, ktraj)
+
+
+def test_nufft_batches_autograd_gpu():
+    if not torch.cuda.is_available():
+        pytest.skip()
+
+    device = torch.device("cuda")
+
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.double)
+    torch.manual_seed(123)
+    shape = [3, 1, 16, 12]
+    kdata_shape = [3, 1, 25]
+    im_size = shape[2:]
+
+    image = create_input_plus_noise(shape, True).to(device)
+    kdata = create_input_plus_noise(kdata_shape, True).to(device)
+    ktraj = (
+        torch.rand(size=(shape[0], len(im_size), kdata_shape[2]), device=device)
+        * 2
+        * torch.pi
+        - torch.pi
+    )
+
+    forw_ob = tkbn.KbNufft(im_size=im_size).to(device)
+    adj_ob = tkbn.KbNufftAdjoint(im_size=im_size).to(device)
+
+    image.requires_grad = True
+    kdata.requires_grad = True
+    image_forw = forw_ob(image, ktraj)
+    kdata_adj = adj_ob(kdata, ktraj)
+
+    (torch.abs(image_forw) ** 2 / 2).sum().backward()
+    (torch.abs(kdata_adj) ** 2 / 2).sum().backward()
+    autograd_forw = image.grad.clone()
+    autograd_adj = kdata.grad.clone()
+    grad_forw_est = adj_ob(image_forw.detach(), ktraj)
+    grad_adj_est = forw_ob(kdata_adj.detach(), ktraj)
+
+    assert torch.allclose(autograd_forw, grad_forw_est)
+    assert torch.allclose(autograd_adj, grad_adj_est)
+
+    torch.set_default_dtype(default_dtype)

@@ -8,6 +8,7 @@ from .._math import imag_exp
 
 # a little hacky but we don't have a function for detecting OMP
 USING_OMP = "USE_OPENMP=ON" in torch.__config__.show()
+CUDA_INTERP_MAX_CHUNK_ELEMENTS = 2**22
 
 
 def spmat_interp(
@@ -203,6 +204,151 @@ def table_interp_one_batch(
     )
 
 
+def _grid_size_to_flat_strides(grid_size: Tensor) -> Tensor:
+    """Return strides for flattening an n-dimensional grid."""
+    strides = torch.ones_like(grid_size)
+    if grid_size.numel() > 1:
+        strides[:-1] = torch.cumprod(grid_size.flip(0), dim=0).flip(0)[1:]
+
+    return strides
+
+
+def _offsets_per_cuda_chunk(batch_size: int, ktraj_len: int, num_offsets: int) -> int:
+    """Return how many interpolation offsets to process in one CUDA chunk."""
+    elements_per_offset = max(1, batch_size * ktraj_len)
+
+    return max(
+        1, min(num_offsets, CUDA_INTERP_MAX_CHUNK_ELEMENTS // elements_per_offset)
+    )
+
+
+def _calc_batched_interp_coefficients_and_indices(
+    tm: Tensor,
+    base_offset: Tensor,
+    offsets: Tensor,
+    tables: List[Tensor],
+    centers: Tensor,
+    table_oversamp: Tensor,
+    grid_size: Tensor,
+    conjcoef: bool = False,
+) -> Tuple[Tensor, Tensor]:
+    """Calculate interpolation coefficients and grid indices for batched omega.
+
+    The existing single-trajectory helper returns tensors shaped ``[M]`` for one
+    offset. This batched CUDA helper keeps both the batch and offset dimensions:
+    ``coef`` and ``arr_ind`` are shaped ``[B, num_offsets, M]``.
+    """
+    batch_size = tm.shape[0]
+    num_offsets = offsets.shape[0]
+    num_dims = tm.shape[1]
+    ktraj_len = tm.shape[2]
+    device = tm.device
+
+    gridind = base_offset.unsqueeze(1) + offsets.view(1, num_offsets, num_dims, 1)
+    distind = torch.round(
+        (tm.unsqueeze(1) - gridind.to(tm))
+        * table_oversamp.to(tm).view(1, 1, num_dims, 1)
+    ).to(dtype=torch.long)
+
+    strides = _grid_size_to_flat_strides(grid_size)
+
+    coef = torch.ones(
+        batch_size, num_offsets, ktraj_len, dtype=tables[0].dtype, device=device
+    )
+    arr_ind = torch.zeros(
+        batch_size, num_offsets, ktraj_len, dtype=torch.long, device=device
+    )
+
+    for d, table in enumerate(tables):
+        table_values = table[distind[:, :, d] + centers[d]]
+        if conjcoef:
+            table_values = table_values.conj()
+
+        coef = coef * table_values
+        arr_ind = arr_ind + torch.remainder(gridind[:, :, d], grid_size[d]) * strides[d]
+
+    return coef, arr_ind
+
+
+def _sort_batched_adjoint_inputs(
+    tm: Tensor, omega: Tensor, data: Tensor, grid_size: Tensor
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Sort each batched trajectory by flattened grid location for adjoint."""
+    strides = _grid_size_to_flat_strides(grid_size)
+    sort_key = torch.zeros_like(tm[:, 0])
+    for d in range(tm.shape[1]):
+        sort_key = sort_key + torch.remainder(tm[:, d], grid_size[d]) * strides[d]
+
+    indices = torch.argsort(sort_key, dim=1)
+    tm = torch.gather(tm, 2, indices.unsqueeze(1).expand(-1, tm.shape[1], -1))
+    omega = torch.gather(omega, 2, indices.unsqueeze(1).expand(-1, omega.shape[1], -1))
+    data = torch.gather(data, 2, indices.unsqueeze(1).expand(-1, data.shape[1], -1))
+
+    return tm, omega, data
+
+
+def _table_interp_batched_omega_cuda(
+    image: Tensor,
+    omega: Tensor,
+    tables: List[Tensor],
+    n_shift: Tensor,
+    numpoints: Tensor,
+    table_oversamp: Tensor,
+    offsets: Tensor,
+) -> Tensor:
+    """Vectorized CUDA table interpolation for true batched trajectories."""
+    dtype = image.dtype
+    device = image.device
+    int_type = torch.long
+
+    grid_size = torch.tensor(image.shape[2:], dtype=int_type, device=device)
+
+    # Convert from radians/voxel to Cartesian grid-index units.
+    tm = omega / (2 * np.pi / grid_size.to(omega).view(1, -1, 1))
+
+    centers = torch.floor(numpoints * table_oversamp / 2).to(dtype=int_type)
+    base_offset = 1 + torch.floor(tm - numpoints.view(1, -1, 1) / 2.0).to(
+        dtype=int_type
+    )
+
+    batch_size, num_coils = image.shape[:2]
+    image = image.reshape(batch_size, num_coils, -1)
+    kdat = torch.zeros(
+        batch_size, num_coils, omega.shape[-1], dtype=dtype, device=device
+    )
+
+    # Chunk over offsets to keep the [B, num_offsets, M] intermediates bounded.
+    offsets_per_chunk = _offsets_per_cuda_chunk(
+        batch_size, omega.shape[-1], offsets.shape[0]
+    )
+    for offset_chunk in offsets.split(offsets_per_chunk):
+        coef, arr_ind = _calc_batched_interp_coefficients_and_indices(
+            tm=tm,
+            base_offset=base_offset,
+            offsets=offset_chunk,
+            tables=tables,
+            centers=centers,
+            table_oversamp=table_oversamp,
+            grid_size=grid_size,
+        )
+
+        gather_ind = (
+            arr_ind.reshape(batch_size, -1).unsqueeze(1).expand(-1, num_coils, -1)
+        )
+        gathered = torch.gather(image, 2, gather_ind).view(
+            batch_size, num_coils, offset_chunk.shape[0], omega.shape[-1]
+        )
+        for offset_idx in range(offset_chunk.shape[0]):
+            kdat = kdat + gathered[:, :, offset_idx] * coef[:, offset_idx].unsqueeze(
+                1
+            ).to(dtype)
+
+    return kdat * imag_exp(
+        torch.sum(omega * n_shift.view(1, -1, 1), dim=-2, keepdim=True),
+        return_complex=True,
+    )
+
+
 @torch.jit.script
 def table_interp_multiple_batches(
     image: Tensor,
@@ -354,6 +500,10 @@ def table_interp(
             raise ValueError(
                 "If omega has batch dim, omega batch dimension must match image."
             )
+        if image.device.type == "cuda":
+            return _table_interp_batched_omega_cuda(
+                image, omega, tables, n_shift, numpoints, table_oversamp, offsets
+            )
 
     # we fork processes for accumulation, so we need to do a bit of thread
     # management for OMP to make sure we don't oversubscribe (managment not
@@ -373,11 +523,28 @@ def table_interp(
 
         if USING_OMP and image.device == torch.device("cpu"):
             torch.set_num_threads(threads_per_fork)
-        kdat = table_interp_fork_over_batchdim(
-            image, omega, tables, n_shift, numpoints, table_oversamp, offsets, num_forks
-        )
-        if USING_OMP and image.device == torch.device("cpu"):
+            kdat = table_interp_fork_over_batchdim(
+                image,
+                omega,
+                tables,
+                n_shift,
+                numpoints,
+                table_oversamp,
+                offsets,
+                num_forks,
+            )
             torch.set_num_threads(num_threads)
+        else:
+            kdat = table_interp_fork_over_batchdim(
+                image,
+                omega,
+                tables,
+                n_shift,
+                numpoints,
+                table_oversamp,
+                offsets,
+                num_forks,
+            )
     elif image.device == torch.device("cpu"):
         # determine number of process forks while keeping a minimum amount of
         # k-space per fork
@@ -584,6 +751,72 @@ def sort_data(
     return tm_ret, omega_ret, data_ret
 
 
+def _table_interp_adjoint_batched_omega_cuda(
+    data: Tensor,
+    omega: Tensor,
+    tables: List[Tensor],
+    n_shift: Tensor,
+    numpoints: Tensor,
+    table_oversamp: Tensor,
+    offsets: Tensor,
+    grid_size: Tensor,
+) -> Tensor:
+    """Vectorized CUDA adjoint table interpolation for batched trajectories."""
+    dtype = data.dtype
+    device = data.device
+    int_type = torch.long
+    batch_size, num_coils = data.shape[:2]
+
+    output_prod = int(torch.prod(grid_size))
+    output_size = [batch_size, num_coils]
+    for el in grid_size:
+        output_size.append(int(el))
+
+    tm = omega / (2 * np.pi / grid_size.to(omega).view(1, -1, 1))
+    tm, omega, data = _sort_batched_adjoint_inputs(tm, omega, data, grid_size)
+
+    centers = torch.floor(numpoints * table_oversamp / 2).to(dtype=int_type)
+    base_offset = 1 + torch.floor(tm - numpoints.view(1, -1, 1) / 2.0).to(
+        dtype=int_type
+    )
+
+    data = (
+        data
+        * imag_exp(
+            torch.sum(omega * n_shift.view(1, -1, 1), dim=-2, keepdim=True),
+            return_complex=True,
+        ).conj()
+    )
+
+    image = torch.zeros(
+        size=(batch_size, num_coils, output_prod), dtype=dtype, device=device
+    )
+
+    # Each non-Cartesian sample contributes to multiple Cartesian grid points.
+    # scatter_add_ performs the required accumulation over repeated grid indices.
+    offsets_per_chunk = _offsets_per_cuda_chunk(
+        batch_size, omega.shape[-1], offsets.shape[0]
+    )
+    for offset_chunk in offsets.split(offsets_per_chunk):
+        coef, arr_ind = _calc_batched_interp_coefficients_and_indices(
+            tm=tm,
+            base_offset=base_offset,
+            offsets=offset_chunk,
+            tables=tables,
+            centers=centers,
+            table_oversamp=table_oversamp,
+            grid_size=grid_size,
+            conjcoef=True,
+        )
+
+        for offset_idx in range(offset_chunk.shape[0]):
+            scatter_ind = arr_ind[:, offset_idx].unsqueeze(1).expand(-1, num_coils, -1)
+            scatter_values = data * coef[:, offset_idx].unsqueeze(1).to(dtype)
+            image.scatter_add_(2, scatter_ind, scatter_values)
+
+    return image.view(output_size)
+
+
 def table_interp_adjoint(
     data: Tensor,
     omega: Tensor,
@@ -630,6 +863,17 @@ def table_interp_adjoint(
         if not omega.shape[0] == data.shape[0]:
             raise ValueError(
                 "If omega has batch dim, omega batch dimension must match data."
+            )
+        if data.device.type == "cuda":
+            return _table_interp_adjoint_batched_omega_cuda(
+                data=data,
+                omega=omega,
+                tables=tables,
+                n_shift=n_shift,
+                numpoints=numpoints,
+                table_oversamp=table_oversamp,
+                offsets=offsets,
+                grid_size=grid_size,
             )
 
     # we fork processes for accumulation, so we need to do a bit of thread

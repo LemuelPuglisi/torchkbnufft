@@ -75,3 +75,34 @@ def test_batched_dcomp(shape, kdata_shape):
     assert torch.allclose(torch.cat(forloop_dcomp), batched_dcomp)
 
     torch.set_default_dtype(default_dtype)
+
+
+def test_batched_dcomp_gpu():
+    if not torch.cuda.is_available():
+        pytest.skip()
+
+    device = torch.device("cuda")
+
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.double)
+    torch.manual_seed(123)
+    im_size = (32, 16)
+    batch_size = 4
+    klength = 83
+
+    ktraj = torch.rand(size=(batch_size, len(im_size), klength), device=device)
+    ktraj = ktraj * 2 * np.pi - np.pi
+
+    forloop_dcomp = []
+    for ktraj_it in ktraj:
+        forloop_dcomp.append(
+            tkbn.calc_density_compensation_function(ktraj=ktraj_it, im_size=im_size)
+        )
+
+    batched_dcomp = tkbn.calc_density_compensation_function(
+        ktraj=ktraj, im_size=im_size
+    )
+
+    assert torch.allclose(torch.cat(forloop_dcomp), batched_dcomp)
+
+    torch.set_default_dtype(default_dtype)

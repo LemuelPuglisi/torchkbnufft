@@ -329,6 +329,98 @@ def test_interp_batches(shape, kdata_shape, is_complex):
 
 
 @pytest.mark.parametrize(
+    "shape, kdata_shape",
+    [
+        ([4, 1, 32, 16], [4, 1, 83]),
+        ([3, 2, 13, 18, 12], [3, 2, 112]),
+    ],
+)
+def test_interp_batches_gpu(shape, kdata_shape):
+    if not torch.cuda.is_available():
+        pytest.skip()
+
+    device = torch.device("cuda")
+
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.double)
+    torch.manual_seed(123)
+    im_size = shape[2:]
+
+    image = create_input_plus_noise(shape, True).to(device)
+    kdata = create_input_plus_noise(kdata_shape, True).to(device)
+    ktraj = (
+        torch.rand(size=(shape[0], len(im_size), kdata_shape[2]), device=device)
+        * 2
+        * np.pi
+        - np.pi
+    )
+
+    forw_ob = tkbn.KbInterp(im_size=im_size, grid_size=im_size).to(device)
+    adj_ob = tkbn.KbInterpAdjoint(im_size=im_size, grid_size=im_size).to(device)
+
+    forloop_test_forw = []
+    for image_it, ktraj_it in zip(image, ktraj):
+        forloop_test_forw.append(forw_ob(image_it.unsqueeze(0), ktraj_it))
+
+    batched_test_forw = forw_ob(image, ktraj)
+
+    assert torch.allclose(torch.cat(forloop_test_forw), batched_test_forw)
+
+    forloop_test_adj = []
+    for data_it, ktraj_it in zip(kdata, ktraj):
+        forloop_test_adj.append(adj_ob(data_it.unsqueeze(0), ktraj_it))
+
+    batched_test_adj = adj_ob(kdata, ktraj)
+
+    assert torch.allclose(torch.cat(forloop_test_adj), batched_test_adj)
+
+    torch.set_default_dtype(default_dtype)
+
+
+def test_interp_batches_autograd_gpu():
+    if not torch.cuda.is_available():
+        pytest.skip()
+
+    device = torch.device("cuda")
+
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.double)
+    torch.manual_seed(123)
+    shape = [3, 1, 16, 12]
+    kdata_shape = [3, 1, 25]
+    im_size = shape[2:]
+
+    image = create_input_plus_noise(shape, True).to(device)
+    kdata = create_input_plus_noise(kdata_shape, True).to(device)
+    ktraj = (
+        torch.rand(size=(shape[0], len(im_size), kdata_shape[2]), device=device)
+        * 2
+        * np.pi
+        - np.pi
+    )
+
+    forw_ob = tkbn.KbInterp(im_size=im_size, grid_size=im_size).to(device)
+    adj_ob = tkbn.KbInterpAdjoint(im_size=im_size, grid_size=im_size).to(device)
+
+    image.requires_grad = True
+    kdata.requires_grad = True
+    image_forw = forw_ob(image, ktraj)
+    kdata_adj = adj_ob(kdata, ktraj)
+
+    (torch.abs(image_forw) ** 2 / 2).sum().backward()
+    (torch.abs(kdata_adj) ** 2 / 2).sum().backward()
+    autograd_forw = image.grad.clone()
+    autograd_adj = kdata.grad.clone()
+    grad_forw_est = adj_ob(image_forw.detach(), ktraj)
+    grad_adj_est = forw_ob(kdata_adj.detach(), ktraj)
+
+    assert torch.allclose(autograd_forw, grad_forw_est)
+    assert torch.allclose(autograd_adj, grad_adj_est)
+
+    torch.set_default_dtype(default_dtype)
+
+
+@pytest.mark.parametrize(
     "shape, kdata_shape, is_complex, dtype",
     [
         ([1, 1, 19], [1, 1, 25], True, torch.complex64),
